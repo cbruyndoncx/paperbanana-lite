@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import base64
+import concurrent.futures
 import datetime
 import json
 import os
@@ -28,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 import uuid
 from io import BytesIO
 from pathlib import Path
@@ -42,6 +44,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 VLM_MODEL = "gemini-2.0-flash"
 IMAGE_MODEL = "gemini-3-pro-image-preview"
 NUM_RETRIEVAL_EXAMPLES = 10
+
+REFERENCE_BASE_URL = "https://raw.githubusercontent.com/llmsresearch/paperbanana/main/data/reference_sets"
+DEFAULT_REFERENCE_DIR = Path.home() / ".paperbanana" / "reference_sets"
 
 # Module-level client — lazily initialized
 _client = None
@@ -849,8 +854,86 @@ def generate_image(prompt, width=1792, height=1024):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# REFERENCE LOADING
+# REFERENCE FETCHING & LOADING
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+def fetch_references(target_dir=None):
+    """Download the reference dataset (index.json + images) from GitHub.
+
+    Args:
+        target_dir: Where to store the references. Defaults to ~/.paperbanana/reference_sets.
+
+    Returns:
+        Path to the reference directory.
+    """
+    target = Path(target_dir) if target_dir else DEFAULT_REFERENCE_DIR
+    images_dir = target / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    # Download index.json
+    index_url = f"{REFERENCE_BASE_URL}/index.json"
+    index_path = target / "index.json"
+    print("[Setup] Downloading index.json...")
+    urllib.request.urlretrieve(index_url, index_path)
+
+    # Parse index.json to discover image filenames
+    with open(index_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    image_paths = []
+    for item in data.get("examples", []):
+        img = item.get("image_path", "")
+        if img:
+            image_paths.append(img)
+
+    # Download images in parallel
+    def _download_image(img_relpath):
+        filename = Path(img_relpath).name
+        url = f"{REFERENCE_BASE_URL}/images/{filename}"
+        dest = images_dir / filename
+        if dest.exists():
+            return filename, True
+        try:
+            urllib.request.urlretrieve(url, dest)
+            return filename, True
+        except Exception as e:
+            print(f"  Warning: Failed to download {filename}: {e}")
+            return filename, False
+
+    print(f"[Setup] Downloading {len(image_paths)} reference images...")
+    ok = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_download_image, p) for p in image_paths]
+        for future in concurrent.futures.as_completed(futures):
+            _, success = future.result()
+            if success:
+                ok += 1
+
+    total_size = sum(f.stat().st_size for f in target.rglob("*") if f.is_file())
+    print(f"[Setup] Done — {ok}/{len(image_paths)} images, {total_size / 1024:.0f} KB total")
+    print(f"[Setup] Reference set stored at: {target}")
+    return str(target)
+
+
+def _references_complete(reference_dir):
+    """Check whether a reference directory has index.json and all its images."""
+    ref_path = Path(reference_dir)
+    index_file = ref_path / "index.json"
+    if not index_file.exists():
+        return False
+    try:
+        with open(index_file, encoding="utf-8") as f:
+            data = json.load(f)
+        for item in data.get("examples", []):
+            img = item.get("image_path", "")
+            if img:
+                full = ref_path / img
+                if not full.exists():
+                    return False
+    except (json.JSONDecodeError, OSError):
+        return False
+    return True
 
 
 def load_references(reference_dir):
@@ -1187,15 +1270,24 @@ def generate(source_context, caption, reference_dir=None, mode="diagram",
     print(f"Output: {run_dir}")
     print(f"{'='*60}\n")
 
-    # Load references
+    # Load references — auto-fetch if missing
     candidates = []
     if reference_dir:
+        if not _references_complete(reference_dir):
+            print(f"[Setup] Reference set incomplete at {reference_dir}, fetching...")
+            fetch_references(reference_dir)
         candidates = load_references(reference_dir)
     else:
-        # Try default location
+        # Try local repo location first, then default cache
         default_ref = Path("data/reference_sets")
-        if default_ref.exists():
+        if _references_complete(str(default_ref)):
             candidates = load_references(str(default_ref))
+        elif _references_complete(str(DEFAULT_REFERENCE_DIR)):
+            candidates = load_references(str(DEFAULT_REFERENCE_DIR))
+        else:
+            print("[Setup] No reference set found, downloading from GitHub...")
+            fetched = fetch_references()
+            candidates = load_references(fetched)
 
     # ── Phase 1: Linear Planning ─────────────────────────────────
 
@@ -1300,6 +1392,11 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command", help="Generation mode")
 
+    # --- setup subcommand ---
+    setup_parser = subparsers.add_parser("setup", help="Download reference dataset from GitHub")
+    setup_parser.add_argument("--target-dir", default=None,
+                              help=f"Where to store references (default: {DEFAULT_REFERENCE_DIR})")
+
     # --- generate subcommand (diagrams) ---
     gen_parser = subparsers.add_parser("generate", help="Generate a methodology diagram")
     gen_parser.add_argument("--input", required=True,
@@ -1331,6 +1428,10 @@ def main():
     if args.command is None:
         parser.print_help()
         sys.exit(1)
+
+    if args.command == "setup":
+        fetch_references(args.target_dir)
+        return
 
     if args.command == "generate":
         # Read methodology text
